@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -24,6 +25,7 @@ import (
 // and integration with the Xray API for real-time updates.
 type InboundService struct {
 	xrayApi xray.XrayAPI
+	mu      sync.Mutex
 }
 
 // GetInbounds retrieves all inbounds for a specific user.
@@ -222,14 +224,6 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 		return inbound, false, common.NewError("Port already exists:", inbound.Port)
 	}
 
-	existEmail, err := s.checkEmailExistForInbound(inbound)
-	if err != nil {
-		return inbound, false, err
-	}
-	if existEmail != "" {
-		return inbound, false, common.NewError("Duplicate email:", existEmail)
-	}
-
 	clients, err := s.GetClients(inbound)
 	if err != nil {
 		return inbound, false, err
@@ -277,24 +271,33 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 		}
 	}
 
-	db := database.GetDB()
-	tx := db.Begin()
-	defer func() {
-		if err == nil {
-			tx.Commit()
-		} else {
-			tx.Rollback()
-		}
-	}()
+	if err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	err = tx.Save(inbound).Error
-	if err == nil {
+		existEmail, err := s.checkEmailExistForInbound(inbound)
+		if err != nil {
+			return err
+		}
+		if existEmail != "" {
+			return common.NewError("Duplicate email:", existEmail)
+		}
+
+		db := database.GetDB()
+		tx := db.Begin()
+
+		if err := tx.Save(inbound).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
 		if len(inbound.ClientStats) == 0 {
 			for _, client := range clients {
 				s.AddClientStat(tx, inbound.Id, &client)
 			}
 		}
-	} else {
+		tx.Commit()
+		return nil
+	}(); err != nil {
 		return inbound, false, err
 	}
 
@@ -582,13 +585,6 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 			interfaceClients[i] = cm
 		}
 	}
-	existEmail, err := s.checkEmailsExistForClients(clients)
-	if err != nil {
-		return false, err
-	}
-	if existEmail != "" {
-		return false, common.NewError("Duplicate email:", existEmail)
-	}
 
 	oldInbound, err := s.GetInbound(data.Id)
 	if err != nil {
@@ -613,40 +609,58 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 		}
 	}
 
-	var oldSettings map[string]any
-	err = json.Unmarshal([]byte(oldInbound.Settings), &oldSettings)
-	if err != nil {
-		return false, err
-	}
+	oldSettings, err := func() (map[string]any, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 
-	oldClients := oldSettings["clients"].([]any)
-	oldClients = append(oldClients, interfaceClients...)
-
-	oldSettings["clients"] = oldClients
-
-	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-
-	oldInbound.Settings = string(newSettings)
-
-	db := database.GetDB()
-	tx := db.Begin()
-
-	defer func() {
+		existEmail, err := s.checkEmailsExistForClients(clients)
 		if err != nil {
-			tx.Rollback()
-		} else {
-			tx.Commit()
+			return nil, err
 		}
+		if existEmail != "" {
+			return nil, common.NewError("Duplicate email:", existEmail)
+		}
+
+		var oldSettings map[string]any
+		if err := json.Unmarshal([]byte(oldInbound.Settings), &oldSettings); err != nil {
+			return nil, err
+		}
+
+		oldClients := oldSettings["clients"].([]any)
+		oldClients = append(oldClients, interfaceClients...)
+		oldSettings["clients"] = oldClients
+
+		newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+
+		oldInbound.Settings = string(newSettings)
+
+		db := database.GetDB()
+		tx := db.Begin()
+
+		for _, client := range clients {
+			if len(client.Email) > 0 {
+				s.AddClientStat(tx, data.Id, &client)
+			}
+		}
+
+		if err := tx.Save(oldInbound).Error; err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		tx.Commit()
+		return oldSettings, nil
 	}()
+	if err != nil {
+		return false, err
+	}
 
 	needRestart := false
 	s.xrayApi.Init(p.GetAPIPort())
 	for _, client := range clients {
 		if len(client.Email) > 0 {
-			s.AddClientStat(tx, data.Id, &client)
 			if client.Enable {
 				cipher := ""
 				if oldInbound.Protocol == "shadowsocks" {
@@ -673,7 +687,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 	}
 	s.xrayApi.Close()
 
-	return needRestart, tx.Save(oldInbound).Error
+	return needRestart, nil
 }
 
 func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool, error) {
